@@ -193,7 +193,7 @@ void Ue9::FlushStream()
   }
 
   uint8_t rec_buffer[2];
-  res = recv(m_socket_command, rec_buffer, 4, 0);
+  res = recv(m_socket_command, rec_buffer, 2, 0);
   if (res < 2) {
     throw std::runtime_error("Failed to receive.");
   }
