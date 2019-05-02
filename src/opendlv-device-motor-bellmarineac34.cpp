@@ -15,84 +15,217 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <fstream>
-#include <vector>
-#include <thread>
-#include <chrono>
-#include <mutex>
-
-#include <linux/i2c-dev.h>
 #include <sys/ioctl.h>
-#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+
+#ifdef __linux__
+#include <linux/if.h>
+#include <linux/can.h>
+#endif
+
 #include <unistd.h>
 
-#include "ue9.hpp"
+#include <cstring>
+
+#include <iostream>
+#include <string>
+
 #include "cluon-complete.hpp"
 #include "opendlv-standard-message-set.hpp"
 
 int32_t main(int32_t argc, char **argv) {
   int32_t retCode{0};
   auto commandlineArguments = cluon::getCommandlineArguments(argc, argv);
-  if (0 == commandlineArguments.count("cid") 
-      || 0 == commandlineArguments.count("ip")) {
+  if (0 == commandlineArguments.count("cid")) {
     std::cerr << argv[0] 
-      << " interfaces to the Bellmarine AC-34 motor controller using an"
-      << " LabJack UE9 as a joystick." << std::endl;
-    std::cerr << "Usage:   " << argv[0] 
-      << " --ip=<IP address for the LabJack UE9> "
-      << "--porta=<The port A for the LabJack UE9, default 52360> "
-      << "--portb=<The port B for the LabJack UE9, default 52361> "
-      << "--cid=<OpenDLV session> [--verbose]" << std::endl;
-    std::cerr << "Example: " << argv[0] << " --ip=192.168.0.100 --cid=111" 
+      << " interfaces to the Bellmarine AC-34 motor controller using CAN." 
+      << std::endl;
+    std::cerr << "Usage:   " << argv[0] << " " 
+      << "--can=<name of the CAN interface> "
+      << "--cid=<OpenDLV session> [--sender-stamp-offset] [--verbose]" 
+      << std::endl;
+    std::cerr << "Example: " << argv[0] << " --can=can0 --cid=111 --verbose" 
       << std::endl;
     retCode = 1;
   } else {
-    bool const VERBOSE{commandlineArguments.count("verbose") != 0};
-    uint16_t const CID = std::stoi(commandlineArguments["cid"]);
-    
-    uint32_t const PORTA{(commandlineArguments["porta"].size() != 0) 
-      ? static_cast<uint32_t>(std::stoi(commandlineArguments["porta"])) 
-        : 52360};
-    uint32_t const PORTB{(commandlineArguments["portb"].size() != 0) 
-      ? static_cast<uint32_t>(std::stoi(commandlineArguments["portb"])) 
-        : 52361};
+    bool const verbose{commandlineArguments.count("verbose") != 0};
+    uint16_t const cid = std::stoi(commandlineArguments["cid"]);
+    std::string const canDev{(commandlineArguments["can"].size() != 0) 
+      ? commandlineArguments["can"] : "can0"};
+    int32_t const senderStampOffset{
+      (commandlineArguments["sender-stamp-offset"].size() != 0) 
+        ? std::stoi(commandlineArguments["sender-stamp-offset"]) : 0};
 
-    uint16_t FREQ = 10;
-    std::string const IP = commandlineArguments["ip"];
-    Ue9 ue9(IP, PORTA, PORTB);
+    float pedalPosition = 0.0f;
+    std::mutex pedalPositionMutex;
 
-    double angleTarget = 0.0;
-    std::mutex groundSteeringAngleMutex;
-
-    auto onGroundSteeringRequest{[&angleTarget, &groundSteeringAngleMutex](
-        cluon::data::Envelope &&envelope)
+    auto onPedalPositionRequest{[&pedalPosition, &pedalPositionMutex, 
+      &senderStampOffset, &verbose](cluon::data::Envelope &&envelope)
       {
-        std::lock_guard<std::mutex> lock(groundSteeringAngleMutex);
-        auto groundSteeringRequest = 
-          cluon::extractMessage<opendlv::proxy::GroundSteeringRequest>(
-              std::move(envelope));
-        angleTarget = groundSteeringRequest.groundSteering();
-      }};
-
-    auto atFrequency{[&ue9, &angleTarget, &groundSteeringAngleMutex, &VERBOSE](
-        ) -> bool
-      {
-        std::lock_guard<std::mutex> lock(groundSteeringAngleMutex);
-
-        ue9.WriteDac(0, angleTarget);
-
-        if (VERBOSE) {
-          std::cout << "writing speed: " << angleTarget << std::endl;
+        int32_t senderStamp = envelope.senderStamp();
+        if (senderStamp == senderStampOffset) {
+          std::lock_guard<std::mutex> lock(pedalPositionMutex);
+          auto msg = 
+            cluon::extractMessage<opendlv::proxy::PedalPositionRequest>(
+                std::move(envelope));
+          if (msg.position() > -1.0f && msg.position() < 1.0f) {
+            pedalPosition = msg.position();
+          } else {
+            std::cerr << "Pedal position out of range [-1.0, 1.0]." 
+              << std::endl;
+          }
+          if (verbose) {
+            std::cout << "Pedal position request set to " << pedalPosition 
+               << std::endl;
+          }
         }
-
-        return true;
       }};
 
-    cluon::OD4Session od4{CID};
-    od4.dataTrigger(opendlv::proxy::GroundSteeringRequest::ID(), onGroundSteeringRequest);
-    od4.timeTrigger(FREQ, atFrequency);
-    
-    ue9.WriteDac(0, 0.0);
+    cluon::OD4Session od4{cid};
+    od4.dataTrigger(opendlv::proxy::PedalPositionRequest::ID(),
+        onPedalPositionRequest);
+
+#ifdef __linux__
+    struct sockaddr_can address;
+#endif
+    int32_t socketCan;
+
+    std::cerr << "Opening " << canDev << "... ";
+#ifdef __linux__
+    socketCan = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (socketCan < 0) {
+      std::cerr << "failed." << std::endl;
+      std::cerr << "Error while creating socket: " << strerror(errno) 
+        << std::endl;
+    }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strcpy(ifr.ifr_name, canDev.c_str());
+    if (0 != ioctl(socketCan, SIOCGIFINDEX, &ifr)) {
+      std::cerr << "failed." << std::endl;
+      std::cerr << "Error while getting index for " << canDev << ": " 
+        << strerror(errno) << std::endl;
+      return retCode;
+    }
+
+    memset(&address, 0, sizeof(address));
+    address.can_family = AF_CAN;
+    address.can_ifindex = ifr.ifr_ifindex;
+
+    if (bind(socketCan, reinterpret_cast<struct sockaddr *>(&address),
+          sizeof(address)) < 0) {
+      std::cerr << "failed." << std::endl;
+      std::cerr << "Error while binding socket: " << strerror(errno)
+        << std::endl;
+      return retCode;
+    }
+    std::cerr << "done." << std::endl;
+#else
+    std::cerr << "failed (SocketCAN not available on this platform). " 
+      << std::endl;
+    return retCode;
+#endif
+
+    float const rpmToAngularVelocityFactor = 3.14159f / 30.0f;
+
+    while (od4.isRunning() && socketCan > -1) {
+#ifdef __linux__
+      {
+        struct timeval to;
+        to.tv_sec = 0;
+        to.tv_usec = 20000;
+
+        setsockopt(socketCan, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+
+        struct can_frame frame;
+        int32_t nbytes = read(socketCan, &frame, sizeof(struct can_frame));
+        if ((nbytes > 0) && (nbytes == sizeof(struct can_frame))) {
+
+          struct timeval socketTimeStamp;
+          if (0 != ioctl(socketCan, SIOCGSTAMP, &socketTimeStamp)) {
+            cluon::data::TimeStamp now{cluon::time::now()};
+            socketTimeStamp.tv_sec = now.seconds();
+            socketTimeStamp.tv_usec = now.microseconds();
+          }
+
+          cluon::data::TimeStamp sampleTimeStamp;
+          sampleTimeStamp.seconds(socketTimeStamp.tv_sec);
+          sampleTimeStamp.microseconds(socketTimeStamp.tv_usec);
+
+
+          if (frame.can_dlc == 8) {
+            int16_t motorRpm = (frame.data[1] << 8) + frame.data[0];
+            uint16_t keyswitchVoltageUint = (frame.data[3] << 8) 
+              + frame.data[2];
+            uint16_t batteryCurrentUint = (frame.data[5] << 8) 
+              + frame.data[4];
+            uint16_t rmsCurrentUint = (frame.data[7] << 8) + frame.data[6];
+
+            float motorAngularVelocity = rpmToAngularVelocityFactor 
+              * motorRpm;
+            float keyswitchVoltage = static_cast<float>(keyswitchVoltageUint) 
+              / 100.0f;
+            float batteryCurrent = static_cast<float>(batteryCurrentUint) 
+              / 10.0f;
+            float rmsCurrent = static_cast<float>(rmsCurrentUint) / 10.0f;
+
+            cluon::data::TimeStamp ts = cluon::time::now();
+
+            opendlv::proxy::WheelSpeedReading wheelSpeedReading;
+            wheelSpeedReading.wheelSpeed(motorAngularVelocity);
+            od4.send(wheelSpeedReading, ts, senderStampOffset);
+            
+            opendlv::proxy::VoltageReading voltageReading;
+            voltageReading.voltage(keyswitchVoltage);
+            od4.send(voltageReading, ts, senderStampOffset);
+            
+            opendlv::proxy::ElectricCurrentReading rmsCurrentReading;
+            rmsCurrentReading.electricCurrent(rmsCurrent);
+            od4.send(rmsCurrentReading, ts, senderStampOffset);
+
+            opendlv::proxy::ElectricCurrentReading batteryCurrentReading;
+            batteryCurrentReading.electricCurrent(batteryCurrent);
+            od4.send(batteryCurrentReading, ts, senderStampOffset + 1);
+
+            if (verbose) {
+              std::cout << "Motor RPM: " << motorRpm << " Keyswitch voltage: "
+                << keyswitchVoltage << " Battery current: " << batteryCurrent
+                << " RMS current: " << rmsCurrent << std::endl;
+            }
+          }
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(pedalPositionMutex);
+        int16_t motorRpmInt = static_cast<int16_t>(22000.0f * pedalPosition);
+        int8_t buffer[] = {static_cast<int8_t>(motorRpmInt), 
+          static_cast<int8_t>(motorRpmInt >> 8), 0, 0, 0, 0, 0, 0};
+
+        struct can_frame frame;
+        frame.can_id = 0x200;
+        frame.can_dlc = 8;
+        memcpy(frame.data, buffer, frame.can_dlc);
+        int32_t n = ::write(socketCan, &frame, 
+            sizeof(struct can_frame));
+
+        if (!(0 < n)) {
+          std::clog << "[SocketCANDevice] Write error (" << errno << "): '" 
+            << strerror(errno) << "'" << std::endl;
+        }
+      }
+#endif
+    }
+
+    std::clog << "Closing " << canDev << "... ";
+    if (socketCan > -1) {
+      close(socketCan);
+    }
+    std::clog << "done." << std::endl;
+
+    retCode = 0;
   }
   return retCode;
 }
