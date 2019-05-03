@@ -43,13 +43,15 @@ int32_t main(int32_t argc, char **argv) {
       << std::endl;
     std::cerr << "Usage:   " << argv[0] << " " 
       << "--can=<name of the CAN interface> "
-      << "--cid=<OpenDLV session> [--sender-stamp-offset] [--verbose]" 
+      << "--cid=<OpenDLV session> [--sender-stamp-offset] [--flip] "
+      << "[--verbose]" 
       << std::endl;
     std::cerr << "Example: " << argv[0] << " --can=can0 --cid=111 --verbose" 
       << std::endl;
     retCode = 1;
   } else {
     bool const verbose{commandlineArguments.count("verbose") != 0};
+    bool const flip{commandlineArguments.count("flip") != 0};
     uint16_t const cid = std::stoi(commandlineArguments["cid"]);
     std::string const canDev{(commandlineArguments["can"].size() != 0) 
       ? commandlineArguments["can"] : "can0"};
@@ -201,6 +203,9 @@ int32_t main(int32_t argc, char **argv) {
       {
         std::lock_guard<std::mutex> lock(pedalPositionMutex);
         int16_t motorRpmInt = static_cast<int16_t>(22000.0f * pedalPosition);
+        if (flip) {
+          motorRpmInt = -motorRpmInt;
+        }
         int8_t buffer[] = {static_cast<int8_t>(motorRpmInt), 
           static_cast<int8_t>(motorRpmInt >> 8), 0, 0, 0, 0, 0, 0};
 
